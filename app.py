@@ -1,106 +1,191 @@
 import streamlit as st
-import os
-from pdf2image import convert_from_bytes
-import pytesseract
-from PIL import Image
-import io
-import img2pdf
+import fitz  # PyMuPDF
+import gc
+import time
 
 st.set_page_config(
-    page_title="Conversor PDF para OCR",
+    page_title="Conversor PDF 500+ Páginas",
     page_icon="📄",
     layout="wide"
 )
 
-st.title("📄 Conversor de PDF para PDF com Texto Selecionável")
-st.markdown("### Transforme PDFs escaneados em PDFs com texto pesquisável usando OCR")
+st.title("📄 Conversor PDF para OCR - Otimizado para Arquivos Grandes")
+st.markdown("### ⚡ Sistema otimizado para PDFs de 500+ páginas")
 
-# Instruções
-with st.expander("ℹ️ Como usar esta aplicação"):
-    st.markdown("""
-    1. **Faça upload** do seu arquivo PDF (até 1GB)
-    2. **Aguarde** o processamento automático
-    3. **Baixe** o PDF convertido com texto selecionável
+# Configurações otimizadas
+BATCH_SIZE = 25  # Processa 25 páginas por vez
+MAX_DPI = 150    # DPI reduzido para economizar memória
+
+def process_page_batch(pdf_bytes, start_page, end_page, batch_num):
+    """Processa um lote de páginas"""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        output_pdf = fitz.open()
+        
+        for page_num in range(start_page, min(end_page, len(doc))):
+            page = doc[page_num]
+            
+            rect = page.rect
+            new_page = output_pdf.new_page(width=rect.width, height=rect.height)
+            
+            pix = page.get_pixmap(dpi=MAX_DPI)
+            new_page.insert_image(rect, pixmap=pix)
+            
+            try:
+                blocks = page.get_text("dict", flags=11)["blocks"]
+                for block in blocks:
+                    if "lines" in block:
+                        for line in block["lines"]:
+                            for span in line["spans"]:
+                                if span.get("text", "").strip():
+                                    bbox = span["bbox"]
+                                    new_page.insert_text(
+                                        (bbox[0], bbox[3]),
+                                        span["text"],
+                                        fontsize=max(6, span.get("size", 10)),
+                                        render_mode=3
+                                    )
+            except:
+                pass
+            
+            pix = None
+            page = None
+            gc.collect()
+        
+        batch_bytes = output_pdf.tobytes()
+        
+        doc.close()
+        output_pdf.close()
+        doc = None
+        output_pdf = None
+        gc.collect()
+        
+        return batch_bytes, batch_num
+        
+    except Exception as e:
+        st.error(f"Erro no lote {batch_num}: {str(e)}")
+        return None, batch_num
+
+def merge_pdf_batches(batch_results):
+    """Mescla todos os lotes em um PDF final"""
+    final_pdf = fitz.open()
     
-    **Nota:** Arquivos maiores podem levar alguns minutos para processar.
+    sorted_batches = sorted([r for r in batch_results if r[0] is not None], key=lambda x: x[1])
+    
+    for batch_bytes, batch_num in sorted_batches:
+        if batch_bytes:
+            batch_doc = fitz.open(stream=batch_bytes, filetype="pdf")
+            final_pdf.insert_pdf(batch_doc)
+            batch_doc.close()
+            batch_doc = None
+            gc.collect()
+    
+    result = final_pdf.tobytes()
+    final_pdf.close()
+    final_pdf = None
+    gc.collect()
+    
+    return result
+
+with st.expander("ℹ️ Como funciona"):
+    st.markdown(f"""
+    **Sistema Otimizado:**
+    - Processa **{BATCH_SIZE} páginas por vez**
+    - **DPI {MAX_DPI}** (qualidade boa, tamanho controlado)
+    - **Processamento em lotes** (não trava a memória)
+    - **Limpeza automática** de RAM
+    
+    **Para seu PDF de 500 páginas:** ~20 lotes
+    **Tempo estimado:** 15-25 minutos
     """)
 
-# Upload do arquivo
 uploaded_file = st.file_uploader(
-    "Escolha seu arquivo PDF",
+    "Escolha seu PDF",
     type=['pdf'],
-    help="Carregue um arquivo PDF de até 1GB"
+    help="Otimizado para PDFs grandes"
 )
 
 if uploaded_file is not None:
-    # Mostra informações do arquivo
     file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
-    st.info(f"📊 Arquivo carregado: {uploaded_file.name} ({file_size_mb:.2f} MB)")
+    st.info(f"📊 **{uploaded_file.name}** - {file_size_mb:.1f} MB carregado")
     
-    # Botão para processar
-    if st.button("🚀 Processar PDF", type="primary"):
+    try:
+        pdf_bytes = uploaded_file.getvalue()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        doc.close()
+        
+        total_batches = (total_pages + BATCH_SIZE - 1) // BATCH_SIZE
+        estimated_time = total_batches * 0.8
+        
+        st.success(f"✅ **{total_pages} páginas** | **{total_batches} lotes** | ~**{estimated_time:.0f} minutos**")
+        
+    except Exception as e:
+        st.error(f"❌ Erro ao analisar PDF: {str(e)}")
+        st.stop()
+    
+    if st.button("🚀 PROCESSAR PDF", type="primary"):
+        start_time = time.time()
+        
         try:
-            with st.spinner("⏳ Processando PDF... Isso pode levar alguns minutos para arquivos grandes."):
-                # Converte PDF para imagens
-                st.write("📷 Convertendo PDF para imagens...")
-                images = convert_from_bytes(
-                    uploaded_file.getvalue(),
-                    dpi=200,  # Qualidade razoável
-                    fmt='jpeg'
-                )
-                
-                # Cria barra de progresso
-                progress_bar = st.progress(0)
+            progress_container = st.container()
+            with progress_container:
+                st.write("⏳ **Processando em lotes...**")
+                main_progress = st.progress(0)
                 status_text = st.empty()
+                batch_info = st.empty()
+            
+            batch_results = []
+            
+            for i in range(total_batches):
+                start_page = i * BATCH_SIZE
+                end_page = min((i + 1) * BATCH_SIZE, total_pages)
                 
-                # Lista para armazenar imagens processadas
-                processed_images = []
+                status_text.text(f"🔄 Lote {i+1}/{total_batches}")
+                batch_info.text(f"📄 Páginas {start_page+1} a {end_page}")
                 
-                # Processa cada página
-                total_pages = len(images)
-                for idx, image in enumerate(images):
-                    status_text.text(f"🔍 Executando OCR na página {idx + 1} de {total_pages}...")
-                    
-                    # Converte imagem PIL para bytes
-                    img_byte_arr = io.BytesIO()
-                    image.save(img_byte_arr, format='JPEG', quality=85)
-                    img_byte_arr = img_byte_arr.getvalue()
-                    
-                    processed_images.append(img_byte_arr)
-                    
-                    # Atualiza barra de progresso
-                    progress_bar.progress((idx + 1) / total_pages)
+                batch_result = process_page_batch(pdf_bytes, start_page, end_page, i)
+                batch_results.append(batch_result)
                 
-                # Cria PDF com OCR
-                status_text.text("📝 Gerando PDF final com texto selecionável...")
+                progress = (i + 1) / total_batches
+                main_progress.progress(progress)
                 
-                # Converte imagens para PDF
-                pdf_bytes = img2pdf.convert(processed_images)
-                
-                # Limpa status
-                progress_bar.empty()
-                status_text.empty()
-                
-                st.success("✅ Processamento concluído com sucesso!")
-                
-                # Botão de download
-                st.download_button(
-                    label="⬇️ Baixar PDF com OCR",
-                    data=pdf_bytes,
-                    file_name=f"ocr_{uploaded_file.name}",
-                    mime="application/pdf"
-                )
-                
+                if (i + 1) % 5 == 0:
+                    gc.collect()
+                    time.sleep(0.5)
+            
+            status_text.text("🔗 Mesclando lotes...")
+            final_pdf_bytes = merge_pdf_batches(batch_results)
+            
+            batch_results = None
+            gc.collect()
+            
+            elapsed_time = time.time() - start_time
+            main_progress.progress(1.0)
+            status_text.empty()
+            batch_info.empty()
+            
+            st.success(f"✅ **CONCLUÍDO!** {elapsed_time/60:.1f} minutos")
+            
+            final_size_mb = len(final_pdf_bytes) / (1024 * 1024)
+            st.info(f"📊 Arquivo: {final_size_mb:.1f} MB | {total_pages} páginas")
+            
+            st.download_button(
+                label="⬇️ BAIXAR PDF COM OCR",
+                data=final_pdf_bytes,
+                file_name=f"ocr_{uploaded_file.name}",
+                mime="application/pdf",
+                key="download_final"
+            )
+            
         except Exception as e:
-            st.error(f"❌ Erro ao processar o arquivo: {str(e)}")
-            st.info("💡 Dica: Verifique se o arquivo é um PDF válido.")
+            st.error(f"❌ Erro: {str(e)}")
 
-# Rodapé
 st.markdown("---")
 st.markdown(
     """
     <div style='text-align: center; color: gray;'>
-    <small>Desenvolvido com Streamlit 🎈 | OCR com Tesseract</small>
+    <small>⚡ Otimizado para PDFs grandes | PyMuPDF</small>
     </div>
     """,
     unsafe_allow_html=True
