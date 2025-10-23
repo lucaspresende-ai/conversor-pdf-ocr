@@ -1,5 +1,3 @@
 streamlit
 PyMuPDF
-pdf2image
 requests
-Pillow
